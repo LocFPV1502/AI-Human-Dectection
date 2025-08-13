@@ -6,8 +6,8 @@ import time
 import multiprocessing as mp # Import multiprocessing
 
 # --- CẤU HÌNH ---
-camera_index = 0 # Webcam mặc định của laptop
-confidence_threshold = 0.7 # Ngưỡng tin cậy để phát hiện vật thể
+camera_index = 'http://192.168.0.106:8160/stream.mjpg'# Webcam mặc định của laptop
+confidence_threshold = 0.8 # Ngưỡng tin cậy để phát hiện vật thể
 # -----------------
 
 def frame_grabber(queue, camera_idx):
@@ -39,104 +39,144 @@ def frame_grabber(queue, camera_idx):
     cap.release()
     print("Frame Grabber: Đã thoát.")
     queue.put(None) # Đặt None vào hàng đợi để báo hiệu kết thúc
+def pid_controller(error_queue, Kp, Ki, Kd):
+    """Tiến trình tính toán giá trị điều khiển PID."""
+    print("PID Controller: Bắt đầu hoạt động.")
 
-def object_detection_and_display(queue, confidence_thresh):
-    """Tiến trình nhận diện vật thể và hiển thị."""
-    cv2.namedWindow("Object Detection", cv2.WINDOW_AUTOSIZE)
-    print("Object Detection: Bắt đầu xử lý...")
+    # Các biến cho bộ điều khiển PID
+    last_error = 0
+    integral = 0
+    neutral_throttle = 1500 # Giá trị ga trung bình khi không có sai số
 
     while True:
-        # Lấy khung hình từ hàng đợi
-        frame = queue.get()
-        if frame is None: # Nhận tín hiệu kết thúc từ Frame Grabber
+        # Lấy sai số từ hàng đợi
+        error = error_queue.get()
+        if error is None: # Tín hiệu kết thúc
             break
 
-        # Thực hiện nhận diện vật thể
-        bbox, label, conf = detect_common_objects(frame, model="yolov3-tiny", confidence=confidence_thresh)
+        # --- TÍNH TOÁN PID ---
+        # Thành phần Tỷ lệ (Proportional)
+        P_term = Kp * error
 
-        # Lấy kích thước của khung hình (chiều cao, chiều rộng, kênh)
+        # Thành phần Tích phân (Integral)
+        integral += error
+        I_term = Ki * integral
+        
+        # Chống "Integral Windup" (khi tích phân quá lớn)
+        # Giới hạn giá trị của thành phần tích phân để tránh vọt lố
+        if I_term > 200: I_term = 200
+        if I_term < -200: I_term = -200
+
+        # Thành phần Vi phân (Derivative)
+        derivative = error - last_error
+        D_term = Kd * derivative
+        last_error = error
+        
+        # Tính toán giá trị điều khiển cuối cùng
+        # Bắt đầu từ giá trị trung bình và cộng/trừ phần điều chỉnh của PID
+        pid_adjustment = P_term + I_term + D_term
+        output_throttle = neutral_throttle + pid_adjustment
+
+        # --- GIỚI HẠN OUTPUT TRONG KHOẢNG [1000, 2000] ---
+        output_throttle = max(1000, min(2000, output_throttle))
+        
+        print(f"Error: {error:4.0f} | PID: {int(pid_adjustment):4d} | Output: {int(output_throttle)}")
+        
+        # Ngủ một chút để không làm quá tải CPU
+        time.sleep(0.02) # Tần suất khoảng 50Hz
+
+    print("PID Controller: Đã thoát.")
+    
+# Thêm error_queue vào danh sách tham số
+def object_detection_and_display(queue, error_queue, confidence_thresh): 
+    """Tiến trình nhận diện vật thể, hiển thị, và gửi sai số."""
+    # ... (phần code đầu hàm giữ nguyên) ...
+
+    while True:
+        frame = queue.get()
+        if frame is None:
+            # Gửi tín hiệu kết thúc cho tiến trình PID trước khi thoát
+            error_queue.put(None) 
+            break
+        
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
+        bbox, label, conf = detect_common_objects(frame, model="yolov3", confidence=confidence_thresh)
         height, width, _ = frame.shape
-        # Tính toán tâm của khung hình
         center_frame_x = width // 2
-        center_frame_y = height // 2 # Chúng ta sẽ sử dụng điểm này để vẽ chấm giữa khung hình
-
-        # Vẽ các hộp giới hạn và nhãn
         im_with_detection = draw_bbox(frame, bbox, label, conf)
-
-        # --- VẼ ĐIỂM ĐỎ CHÍNH GIỮA NHÃN 'PERSON' & TÍNH KHOẢNG CÁCH ---
+        
+        person_detected = False
         for box, lbl, cf in zip(bbox, label, conf):
             if lbl == 'person':
-                x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
-                
-                # Tính toán tâm của hộp giới hạn "person"
+                person_detected = True
+                x1, y1, x2, y2 = box
                 center_x_person = int((x1 + x2) / 2)
                 center_y_person = int((y1 + y2) / 2)
+
+                # --- TÍNH TOÁN SAI SỐ (ERROR) ---
+                # Sai số là khoảng cách từ tâm người đến tâm khung hình theo trục X
+                # Dấu (+): người ở bên trái, cần di chuyển sang phải
+                # Dấu (-): người ở bên phải, cần di chuyển sang trái
+                error = center_frame_x - center_x_person
                 
-                # Vẽ điểm tròn màu đỏ tại tâm của "person"
-                cv2.circle(im_with_detection, (center_x_person, center_y_person), 5, (0, 0, 255), -1) # Màu đỏ (BGR)
+                # --- GỬI SAI SỐ CHO TIẾN TRÌNH PID ---
+                if error_queue.qsize() < 5:
+                    error_queue.put(error)
 
-                # Vẽ điểm xanh dương tại giữa khung hình theo trục X, nhưng cùng trục Y với person
-                # (Điểm này là (center_frame_x, center_y_person) như bạn đã code trước đó)
-                # Đây là điểm thứ hai để tính khoảng cách
-                point_on_frame_x = center_frame_x
-                point_on_frame_y = center_y_person # Cùng trục Y với center_y_person
-                cv2.circle(im_with_detection, (point_on_frame_x, point_on_frame_y), 5, (255, 0, 0), -1) # Màu xanh dương (BGR)
+                # ... (phần code vẽ vời giữ nguyên) ...
+                cv2.circle(im_with_detection, (center_x_person, center_y_person), 5, (0, 0, 255), -1)
+                cv2.line(im_with_detection, (center_x_person, center_y_person), (center_frame_x, center_y_person), (0, 255, 255), 2)
+                cv2.putText(im_with_detection, f"Error: {error}", (center_x_person + 10, center_y_person - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                # --- TÍNH KHOẢNG CÁCH GIỮA HAI ĐIỂM ---
-                # Điểm 1: Tâm của person (center_x_person, center_y_person)
-                # Điểm 2: Điểm xanh dương trên trục giữa của khung hình (point_on_frame_x, point_on_frame_y)
-                distance = np.sqrt(
-                    (point_on_frame_x - center_x_person)**2 + 
-                    (point_on_frame_y - center_y_person)**2
-                )
-                
-                # In khoảng cách ra console
-                print(f"Khoảng cách đến tâm màn hình (theo trục Y của person): {int(distance)} pixels")
 
-                # (Tùy chọn) Vẽ đường thẳng nối hai điểm và hiển thị khoảng cách trên ảnh
-                cv2.line(im_with_detection, 
-                         (center_x_person, center_y_person), 
-                         (point_on_frame_x, point_on_frame_y), 
-                         (0, 255, 255), 2) # Màu vàng (BGR)
-
-                cv2.putText(im_with_detection, 
-                            f"Dist: {distance:.0f}", 
-                            (center_x_person + 10, center_y_person - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-        # --- VẼ ĐIỂM ĐỎ CHÍNH GIỮA KHUNG HÌNH (Nếu bạn muốn một chấm cố định ở giữa ảnh) ---
-        # Điểm này là (center_frame_x, center_frame_y)
-        # Nếu bạn chỉ muốn chấm ở vị trí người, thì không cần dòng này
-        # cv2.circle(im_with_detection, (center_frame_x, center_frame_y), 5, (0, 255, 255), -1) # Màu vàng (cho chấm chính giữa ảnh)
+        # Nếu không phát hiện thấy người, gửi sai số = 0
+        if not person_detected:
+            if error_queue.qsize() < 5:
+                error_queue.put(0)
 
         cv2.imshow('Object Detection', im_with_detection)
-
-        key = cv2.waitKey(1)
-        if key == ord('q'):
+        if cv2.waitKey(1) == ord('q'):
+            # Gửi tín hiệu kết thúc cho tiến trình PID nếu thoát bằng 'q'
+            error_queue.put(None)
             break
 
     cv2.destroyAllWindows()
     print("Object Detection: Đã thoát.")
-
 if __name__ == '__main__':
     print("Ứng dụng nhận diện vật thể khởi động.")
     
-    # Tạo một Queue để truyền khung hình giữa các tiến trình
-    frame_queue = mp.Queue()
+    # --- CÁC HẰNG SỐ PID (CẦN HIỆU CHỈNH THỰC TẾ) ---
+    # Kp: Phản ứng với sai số hiện tại. Kp lớn -> phản ứng mạnh.
+    # Ki: Xử lý sai số tích lũy theo thời gian, giúp loại bỏ sai số ổn định.
+    # Kd: Phản ứng với tốc độ thay đổi của sai số, giúp giảm vọt lố và ổn định hệ thống.
+    Kp = 0.4
+    Ki = 0.02
+    Kd = 0.1
+    # -----------------------------------------------------
+
+    # Tạo các Queue để truyền dữ liệu giữa các tiến trình
+    frame_queue = mp.Queue(maxsize=10) # Hàng đợi khung hình
+    error_queue = mp.Queue(maxsize=5)  # Hàng đợi giá trị sai số
 
     # Tạo các tiến trình
     # Tiến trình 1: Đọc khung hình
     p_grabber = mp.Process(target=frame_grabber, args=(frame_queue, camera_index))
-    # Tiến trình 2: Nhận diện và hiển thị
-    p_detector = mp.Process(target=object_detection_and_display, args=(frame_queue, confidence_threshold))
+    
+    # Tiến trình 2: Nhận diện, hiển thị và gửi sai số
+    p_detector = mp.Process(target=object_detection_and_display, args=(frame_queue, error_queue, confidence_threshold))
+
+    # Tiến trình 3: Tính toán PID
+    p_pid = mp.Process(target=pid_controller, args=(error_queue, Kp, Ki, Kd))
 
     # Bắt đầu các tiến trình
     p_grabber.start()
     p_detector.start()
+    p_pid.start()
 
     # Chờ các tiến trình kết thúc
     p_grabber.join()
     p_detector.join()
+    p_pid.join()
 
     print("Tất cả các tiến trình đã kết thúc.")
     print("Ứng dụng đã thoát hoàn toàn.")
